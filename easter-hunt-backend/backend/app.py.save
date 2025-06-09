@@ -1,0 +1,450 @@
+from flask import Flask, render_template, request, jsonify, make_response, redirect, url_for, send_from_directory
+import sqlite3
+import uuid
+from werkzeug.utils import secure_filename
+import os
+import qrcode
+from io import BytesIO
+import base64
+import boto3
+import json
+import requests
+from botocore.exceptions import ClientError
+import hashlib 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
+
+app = Flask(__name__)
+print("Template folder path:", app.template_folder)
+print("Current directory:", os.listdir())
+print("Templates exists?:", os.path.exists('templates'))
+print("Index.html exists?:", os.path.exists('templates/index.html'))
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['DATABASE'] = 'easter.db'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(os.path.join(app.root_path, 'static', '.well-known'), exist_ok=True) # Stelle sicher, dass .well-known existiert
+
+AWS_REGION = 'eu-central-1'
+SNS_TOPIC_ARN = 'arn:aws:sns:eu-central-1:982999333742:egg_found_event'
+
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+dynamodb_table = dynamodb.Table('global-egg-finds')
+
+sns_client = boto3.client('sns', region_name=AWS_REGION)
+
+
+private_key = None
+public_key_for_validation = None
+
+
+def load_private_key(file_path="private_key.pem"):
+    global private_key
+    try:
+        with open(file_path, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=None, 
+                backend=default_backend()
+            )
+        print("Privater Schlüssel erfolgreich geladen.")
+    except FileNotFoundError:
+        print(f"Fehler: Privater Schlüssel '{file_path}' nicht gefunden. Bitte generieren Sie ihn.")
+        private_key = None
+    except Exception as e:
+        print(f"Fehler beim Laden des privaten Schlüssels: {e}")
+        private_key = None
+
+def load_public_key_for_validation(file_path="public_key.pem"):
+    global public_key_for_validation
+    try:
+        with open(file_path, "rb") as key_file:
+            public_key_for_validation = serialization.load_pem_public_key(
+                key_file.read(),
+                backend=default_backend()
+            )
+        print("Öffentlicher Schlüssel für Validierung erfolgreich geladen.")
+    except FileNotFoundError:
+        print(f"Fehler: Öffentlicher Schlüssel '{file_path}' für Validierung nicht gefunden.")
+        public_key_for_validation = None
+    except Exception as e:
+        print(f"Fehler beim Laden des öffentlichen Schlüssels für Validierung: {e}")
+        public_key_for_validation = None
+
+
+def init_db():
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        #Tabelle für die Eier-Definition
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS eggs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                hint TEXT NOT NULL,
+                qr_code TEXT UNIQUE NOT NULL,
+                image_path TEXT,
+                found_count INTEGER DEFAULT 0
+            )
+        ''')
+        # Tabelle für die von Benutzern gefundenen Eier (lokal)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS found_eggs (
+                user_id TEXT NOT NULL,
+                egg_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, egg_id)
+            )
+        ''')
+        conn.commit()
+
+ 
+def sende_osterei_gefunden_nachricht(user_id, egg_id, base_url):
+    global private_key
+    if private_key is None:
+        print("Fehler: Privater Schlüssel nicht geladen. Kann Nachricht nicht signieren.")
+        return # Fehlermeldung an den Benutzer senden
+
+    try:
+        # Dies ist der genaue String, dessen Hash signiert werden muss
+        message_string_to_sign = f"{user_id}\n{egg_id}"
+
+        # Signieren des Hashes mit dem privaten Schlüssel
+        
+        signature = private_key.sign(
+            message_string_to_sign.encode('utf-8'),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        # Die Signatur als Base64-String für die JSON-Nachricht kodieren
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+        # Die Nachricht für SNS erstellen, inklusive Signatur
+        # Dies ist das INNERE JSON-Objekt, das deine Nutzdaten enthält
+        inner_sns_payload = {
+            'userId': user_id,
+            'eggId': str(egg_id), # Sicherstellen, dass eggId ein String ist
+            'url': base_url,
+            'signature': signature_b64 
+        }
+
+        
+        sns_message_for_publish = {
+            'default': json.dumps(inner_sns_payload)
+        }
+
+        # Nachricht an SNS senden
+        response = sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Message=json.dumps(sns_message_for_publish), N
+            MessageStructure='json' 
+        )
+        print(f"Nachricht an SNS gesendet. MessageId: {response['MessageId']}")
+    except ClientError as e:
+        print(f"Fehler beim Senden der Nachricht an SNS: {e}")
+    except Exception as e:
+        print(f"Ein unerwarteter Fehler beim Signieren/Senden an SNS: {e}")
+
+# --- Routen ---
+@app.route('/')
+def index():
+    user_id = request.cookies.get('user_id')
+    if not user_id:
+        user_id = str(uuid.uuid4())
+
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, name, latitude, longitude, hint, image_path FROM eggs')
+        eggs = cursor.fetchall()
+
+        found_eggs = []
+        if user_id:
+            cursor.execute('SELECT egg_id FROM found_eggs WHERE user_id = ?', (user_id,))
+            found_eggs = [row[0] for row in cursor.fetchall()]
+
+    resp = make_response(render_template(
+        'index.html',
+        eggs=eggs,
+        found_eggs=found_eggs
+    ))
+    resp.set_cookie('user_id', user_id, max_age=60*60*24*365*10)  # 10 year cookie
+    return resp
+
+@app.route('/egg/<int:egg_id>')
+def egg_details(egg_id):
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, name, hint FROM eggs WHERE id = ?', (egg_id,))
+        egg = cursor.fetchone()
+
+    if not egg:
+        return "Egg not found", 404
+
+    return jsonify({
+        'id': egg[0],
+        'name': egg[1],
+        'hint': egg[2]
+    })
+
+@app.route('/found/<qr_code>')
+def found_egg(qr_code):
+    user_id = request.cookies.get('user_id')
+    if not user_id:
+        user_id = str(uuid.uuid4())
+
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+
+        # Get egg by QR code
+        cursor.execute('SELECT id FROM eggs WHERE qr_code = ?', (qr_code,))
+        egg = cursor.fetchone()
+
+        if not egg:
+            return "Invalid QR code", 404
+
+        egg_id = egg[0]
+
+        # Check if already found by this user
+        cursor.execute('''
+            SELECT 1 FROM found_eggs
+            WHERE egg_id = ? AND user_id = ?
+        ''', (egg_id, user_id))
+        already_found = cursor.fetchone()
+
+        if not already_found:
+            # Mark as found
+            cursor.execute('''
+                INSERT INTO found_eggs (egg_id, user_id)
+                VALUES (?, ?)
+            ''', (egg_id, user_id))
+
+            conn.commit()
+
+            # Sende die Nachricht an das SNS Topic, nachdem das Ei als gefunden markiert wurde
+            sende_osterei_gefunden_nachricht(user_id, egg_id, request.url_root)
+
+    resp = make_response(redirect(url_for('index')))
+    resp.set_cookie('user_id', user_id, max_age=60*60*24*365*10)
+    return resp
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin():
+    if request.method == 'POST':
+        name = request.form['name']
+        latitude = float(request.form['latitude'])
+        longitude = float(request.form['longitude'])
+        hint = request.form['hint']
+
+        # Generate unique QR code
+        qr_code = str(uuid.uuid4())
+
+        # Handle image upload
+        image_path = None
+        if 'image' in request.files:
+            file = request.files['image']
+            if file.filename != '':
+                filename = secure_filename(file.filename)
+                image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(image_path)
+                image_path = filename  # Store relative path
+
+        with sqlite3.connect(app.config['DATABASE']) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO eggs (name, latitude, longitude, hint, qr_code, image_path)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (name, latitude, longitude, hint, qr_code, image_path))
+            egg_id = cursor.lastrowid
+            conn.commit()
+
+        # Generate QR code image
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(f"{request.url_root}found/{qr_code}")
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+
+        # Save QR code
+        qr_filename = f"qr_{egg_id}.png"
+        qr_path = os.path.join(app.config['UPLOAD_FOLDER'], qr_filename)
+        img.save(qr_path)
+
+        return redirect(url_for('admin'))
+
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, name, latitude, longitude, found_count FROM eggs')
+        eggs = cursor.fetchall()
+
+    return render_template('admin.html', eggs=eggs)
+
+@app.route('/get_found_status')
+def get_found_status():
+    user_id = request.cookies.get('user_id')
+    if not user_id:
+        return jsonify([])
+
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT egg_id FROM found_eggs WHERE user_id = ?', (user_id,))
+        found_eggs = [row[0] for row in cursor.fetchall()]
+
+    return jsonify(found_eggs)
+
+@app.route('/qr_code/<int:egg_id>')
+def get_qr_code(egg_id):
+    with sqlite3.connect(app.config['DATABASE']) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT qr_code FROM eggs WHERE id = ?', (egg_id,))
+        egg = cursor.fetchone()
+
+    if not egg:
+        return "Egg not found", 404
+
+    qr_code = egg[0]
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(f"{request.url_root}found/{qr_code}")
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    img_io = BytesIO()
+    img.save(img_io, 'PNG')
+    img_io.seek(0)
+
+    return img_io.getvalue(), 200, {'Content-Type': 'image/png'}
+
+# --- Aktualisierter SNS-Notification-Endpoint mit Signaturvalidierung ---
+@app.route('/sns_notification', methods=['POST'])
+def sns_notification():
+    try:
+        message_data = json.loads(request.get_data().decode('utf-8'))
+        message_type = message_data.get('Type')
+
+        if message_type == 'SubscriptionConfirmation':
+            subscribe_url = message_data.get('SubscribeURL')
+            if subscribe_url:
+                try:
+                    requests.get(subscribe_url)
+                    print(f"SNS Subscription confirmed from: {subscribe_url}")
+                    return jsonify({'message': 'Subscription confirmed'}), 200
+                except requests.exceptions.RequestException as e:
+                    print(f"Error confirming SNS subscription: {e}")
+                    return jsonify({'error': 'Subscription confirmation failed'}), 500
+            else:
+                print("SubscriptionConfirmation received without SubscribeURL.")
+                return jsonify({'error': 'Missing SubscribeURL'}), 400
+
+        elif message_type == 'Notification':
+            message = json.loads(message_data.get('Message', '{}'))
+            user_id = message.get('userId')
+            egg_id = message.get('eggId')
+            url = message.get('url')
+            signature_b64 = message.get('signature') # Die Signatur aus der Nachricht
+
+            if user_id and egg_id and url and signature_b64:
+                print(f"Egg found - User: {user_id}, Egg ID: {egg_id}, URL: {url}")
+
+                # validierung (Bonus-Teil) ---
+                global public_key_for_validation
+                if public_key_for_validation is None:
+                    print("Warnung: Öffentlicher Schlüssel für Validierung nicht geladen. Signaturprüfung übersprungen.")
+                else:
+                    try:
+                        # Den zu validierenden String erstellen
+                        message_string_to_verify = f"{user_id}\n{egg_id}"
+
+                        # Signatur dekodieren
+                        signature = base64.b64decode(signature_b64)
+
+                        # Signatur validieren
+                        public_key_for_validation.verify(
+                            signature,
+                            message_string_to_verify.encode('utf-8'),
+                            padding.PSS(
+                                mgf=padding.MGF1(hashes.SHA256()),
+                                salt_length=padding.PSS.MAX_LENGTH
+                            ),
+                            hashes.SHA256()
+                        )
+                        print("Signatur erfolgreich validiert. Nachricht ist authentisch.")
+
+                    except InvalidSignature:
+                        print("Fehler: Signatur ist UNGÜLTIG. Nachricht wird ignoriert.")
+                        return jsonify({'error': 'Invalid signature'}), 401 # Unauthorized
+                    except Exception as e:
+                        print(f"Fehler bei der Signaturvalidierung: {e}")
+                        return jsonify({'error': 'Signature validation error'}), 500
+                
+
+                try:
+                    dynamodb_table.put_item(
+                        Item={
+                            'userId': user_id,
+                            'eggId': egg_id
+                        },
+                        ConditionExpression='attribute_not_exists(userId) AND attribute_not_exists(eggId)'
+                    )
+                    print(f"Successfully recorded unique global find: User {user_id}, Egg ID {egg_id}")
+                    return jsonify({'message': 'Notification received and processed'}), 200
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                        print(f"Duplicate global find ignored: User {user_id}, Egg ID {egg_id} already recorded.")
+                        return jsonify({'message': 'Duplicate find ignored'}), 200
+                    else:
+                        print(f"DynamoDB error recording global find: {e}")
+                        return jsonify({'error': 'Database error recording find'}), 500
+            else:
+                print(f"Incomplete SNS notification data: {message}")
+                return jsonify({'error': 'Incomplete notification data'}), 400
+        else:
+            print(f"Unknown SNS message type: {message_type}")
+            return jsonify({'error': 'Unknown message type'}), 400
+    except json.JSONDecodeError:
+        print("Error decoding JSON from SNS notification")
+        return jsonify({'error': 'Invalid JSON format'}), 400
+    except Exception as e:
+        print(f"Unhandled error in sns_notification: {e}")
+        return jsonify({'error': 'Internal Server Error'}), 500
+
+@app.route('/api/global_egg_count', methods=['GET'])
+def get_global_egg_count():
+    try:
+        response = dynamodb_table.scan(Select='COUNT')
+        global_count = response.get('Count', 0)
+        print(f"Returning global egg count: {global_count}")
+        return jsonify({'global_count': global_count}), 200
+    except ClientError as e:
+        print(f"DynamoDB error retrieving global count: {e}")
+        return jsonify({'error': 'Could not retrieve global count'}), 500
+ 
+@app.route('/.well-known/egg_security.pub')
+def serve_public_key():
+
+    return send_from_directory(os.path.join(app.root_path, 'static', '.well-known'),
+                               'egg_security.pub', mimetype='application/x-pem-file')
+
+
+if __name__ == '__main__':
+    init_db() # Datenbank initialisieren
+    load_private_key() # Privaten Schlüssel laden (zum Signieren)
+    load_public_key_for_validation() # Öffentlichen Schlüssel laden (zum Validieren der eigenen Nachrichten)
+    app.run(host='0.0.0.0',port=3000,debug=True)

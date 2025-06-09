@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ostereier-Suche</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #map {
+            height: 500px;
+            width: 100%;
+            background-color: #eee;
+        }
+        body {
+            padding: 20px;
+        }
+        .egg-marker {
+            background-color: #ff69b4;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            border: 2px solid white;
+            text-align: center;
+            color: white;
+            font-weight: bold;
+            line-height: 20px; /* Center text vertically */
+        }
+        .egg-marker.found {
+            background-color: #28a745;
+        }
+        /* Style for the global count section */
+        #global-count-section {
+            margin-top: 20px;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Ostereier-Suche</h1>
+        <div class="alert alert-info" id="status-message"></div>
+        <div id="map"></div>
+        <div class="mt-3">
+            <h3>Gefundene Eier: <span id="found-count">0</span>/<span id="total-eggs">0</span></h3>
+            <div id="global-count-section">
+                Global Gefundene Eier: <span id="global-found-count">-</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        // Global variables
+        let markers = [];
+        const userId = getUserId();
+
+        // Initialize map
+        const map = L.map('map').setView([51.0, 10.0], 6);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(map);
+
+        // Get user ID from cookie
+        function getUserId() {
+            const match = document.cookie.match(/user_id=([^;]+)/);
+            return match ? match[1] : '';
+        }
+
+        // Load found eggs status for the current user
+        async function loadMyFoundEggs() {
+            try {
+                const response = await fetch('/get_found_status'); // Cette route Flask renvoie les IDs trouvés par cet utilisateur
+                return await response.json();
+            } catch (error) {
+                console.error('Error loading my found eggs:', error);
+                return [];
+            }
+        }
+
+        // Load the global count of found eggs
+        async function loadGlobalEggCount() {
+             try {
+                 const response = await fetch('/api/global_egg_count'); // Nouvelle route API dans ton backend Flask
+                 const data = await response.json();
+                 return data.global_count; // Le nom du champ correspond à ce que ton API Flask renvoie
+             } catch (error) {
+                 console.error('Error loading global egg count:', error);
+                 return '-'; // Afficher un tiret ou 0 en cas d'erreur
+             }
+         }
+
+
+        // Initialize markers and load counts
+        async function initMap() {
+            const eggsData = {{ eggs|tojson }}; // Données des oeufs depuis le backend Flask
+            const myFoundEggs = await loadMyFoundEggs(); // Oeufs trouvés par l'utilisateur actuel
+            const globalCount = await loadGlobalEggCount(); // Nombre global d'oeufs trouvés
+
+            // Mettre à jour le compteur local
+            document.getElementById('total-eggs').textContent = eggsData.length;
+            document.getElementById('found-count').textContent = myFoundEggs.length;
+
+            // Mettre à jour le compteur global
+            document.getElementById('global-found-count').textContent = globalCount;
+
+            eggsData.forEach((egg, index) => {
+                const isFound = myFoundEggs.includes(egg[0]);
+                const marker = L.marker([egg[2], egg[3]], {
+                    icon: L.divIcon({
+                        className: `egg-marker ${isFound ? 'found' : ''}`,
+                        html: `${index + 1}`,
+                        iconSize: [30, 30]
+                    })
+                }).addTo(map);
+
+                marker.bindPopup(`
+                    <b>${egg[1]}</b><br>
+                    ${isFound ? '<span class="text-success">✓ Gefunden</span>' : egg[4]}
+                    ${egg[5] ? `<img src="/static/uploads/${egg[5]}" width="100" class="mt-2">` : ''}
+                `);
+
+                markers.push({
+                    id: egg[0],
+                    marker: marker,
+                    isFound: isFound
+                });
+            });
+
+            updateStatusMessage(myFoundEggs.length, eggsData.length);
+        }
+
+        // Update status message (basé sur la découverte locale)
+        function updateStatusMessage(found, total) {
+            const message = document.getElementById('status-message');
+            if (found === total) {
+                message.textContent = 'Glückwunsch! Sie haben alle Ostereier gefunden!';
+                message.className = 'alert alert-success';
+            } else {
+                message.textContent = `Noch ${total - found} Ostereier zu finden`;
+                message.className = 'alert alert-info';
+            }
+        }
+
+        // Initialize everything when page loads
+        document.addEventListener('DOMContentLoaded', initMap);
+
+        // Bonus: Optionnel - Rafraîchir le compteur global régulièrement (pas temps réel, mais mieux qu'un simple chargement de page)
+        setInterval(async () => {
+            const globalCount = await loadGlobalEggCount();
+            document.getElementById('global-found-count').textContent = globalCount;
+        }, 15000); // Rafraîchir toutes les 15 secondes
+    </script>
+</body>
+</html>

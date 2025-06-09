@@ -1,0 +1,5 @@
+boto3==1.x.x
+Flask==2.x.x
+qrcode==7.x.x
+cryptography==3.x.x
+requests==2.x.x
