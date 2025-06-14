@@ -3,14 +3,14 @@
 ## Kurzbeschreibung
 Dieses Projekt ist eine interaktive Webanwendung (Flask), die eine digitale Ostereier-Suche simuliert. Es nutzt AWS-Dienste wie **DynamoDB** zur globalen Speicherung von Fundmeldungen und **SNS** für die Benachrichtigung bei Ei-Funden. Ein zentrales Merkmal ist die **Implementierung kryptographischer Signaturen** (RSA-PSS) zur Authentifizierung der Fundmeldungen, was die Integrität und Vertrauenswürdigkeit des Systems gewährleistet. Jedes Ei ist mit einem eindeutigen QR-Code verknüpft, der das Scannen und Registrieren des Fundes ermöglicht.
 
-## Relevanz für DLR-Projekte (z.B. ATHMoS / Missionskontrollsysteme)
-Obwohl dieses Projekt eine spielerische Anwendung ist, demonstriert es mehrere Kernkompetenzen, die für die Entwicklung robuster und skalierbarer Software im Kontext des DLR und insbesondere für Projekte wie "ATHMoS" oder allgemeine Missionskontrollsysteme von hoher Relevanz sind:
+
+Dieses Projekt demonstriert mehrere Kernkompetenzen, die für die Entwicklung robuster und skalierbarer Software von hoher Relevanz sind:
 
 * **Cloud Computing & Verteilte Architekturen:** Erfahrung im Umgang mit AWS (DynamoDB, SNS) und dem Entwurf von Systemen, die über mehrere Dienste interagieren. Dies ist entscheidend für moderne, resiliente Raumfahrtbodensegmente.
 * **Datenverarbeitung & Pipelines:** Das Senden von Fundereignissen via SNS und deren Persistierung in DynamoDB zeigt Grundkenntnisse im Aufbau von Datenpipelines und der Verarbeitung von Ereignissen.
 * **Sicherheit & Authentizität:** Die Implementierung von RSA-PSS-Signaturen zur Authentifizierung von Nachrichten unterstreicht das Verständnis für kritische Sicherheitsaspekte in verteilten Systemen, die für den sicheren Betrieb von Raumfahrtmissionen unerlässlich sind.
 * **Python-Entwicklung:** Die gesamte Anwendung ist in Python geschrieben und zeigt fundierte Kenntnisse in der Entwicklung komplexer Webanwendungen und Backend-Logik.
-* **Potenzial für Containerisierung & Orchestrierung:** Die Anwendung ist modular aufgebaut und ideal für ein Deployment in Container-Umgebungen wie **Kubernetes**, was eine Anforderung für die DLR-Stelle ist und meine Fähigkeit unterstreicht, Applikationen für skalierbare Infrastrukturen zu entwickeln.
+* **Potenzial für Containerisierung & Orchestrierung:** Die Anwendung ist modular aufgebaut und ideal für ein Deployment in Container-Umgebungen wie **Kubernetes**.
 
 ## Technologien
 * **Backend:** Python 3.x, Flask
@@ -40,7 +40,7 @@ Um das Projekt lokal auszuführen, folge diesen Schritten:
 2.  **Repository klonen:**
     ```bash
     git clone https://github.com/Raph11111/Oster-EIer-Tracking.git(https://github.com/Raph11111/Oster-EIer-Tracking.git)
-    cd DeinRepositoryName
+    cd Oster-EIer-Tracking
     ```
 
 3.  **Virtuelle Umgebung erstellen und aktivieren:**
